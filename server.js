@@ -1,148 +1,435 @@
-const express = require("express");
-const cors = require("cors");
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-const crypto = require("crypto");
+/**
+ * ChoresApp — Complete Stripe Backend
+ * Stack: Node.js + Express
+ * Deploy: Railway (set env vars in Railway dashboard)
+ *
+ * ENV VARS NEEDED:
+ *   STRIPE_SECRET_KEY      — sk_live_...
+ *   STRIPE_WEBHOOK_SECRET  — whsec_...  (from Stripe Dashboard > Webhooks)
+ *   PORT                   — Railway sets this automatically
+ */
 
+const express = require("express");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
-// ─────────────────────────────────────────────────────────────
-// SECURITY & MIDDLEWARE
-// ─────────────────────────────────────────────────────────────
-app.use(cors({ origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] }));
+// ─── IMPORTANT: Raw body needed for webhook signature verification ────────────
+app.use("/api/webhook", express.raw({ type: "application/json" }));
+app.use(express.json());
 
 app.use((req, res, next) => {
-  if (req.path === "/api/webhook") return next();
-  express.json()(req, res, next);
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
 });
 
-// Rate limiter — no extra packages needed
-const rateLimitMap = new Map();
-function rateLimit(maxRequests, windowMs) {
-  return (req, res, next) => {
-    const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
-    const now = Date.now();
-    const entry = rateLimitMap.get(ip);
-    if (!entry || now > entry.resetAt) {
-      rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
-      return next();
-    }
-    if (entry.count >= maxRequests) {
-      return res.status(429).json({ error: "Too many requests — please wait a moment." });
-    }
-    entry.count++;
-    next();
-  };
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. CHARGE (Create escrow — funds held, not captured yet)
+//    Called when poster books a worker and pays
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/charge", async (req, res) => {
+  const { paymentMethodId, amountCents, jobId, jobTitle, posterCustomerId } = req.body;
 
-// In-memory email code store (resets on server restart — fine for MVP)
-const emailCodes = new Map();
-
-// ─────────────────────────────────────────────────────────────
-// HEALTH CHECK
-// ─────────────────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.json({ status: "Chores API running ✅", domain: "choresnearme.com" });
-});
-
-// ─────────────────────────────────────────────────────────────
-// EMAIL VERIFICATION — send code (max 3 per 10 mins)
-// ─────────────────────────────────────────────────────────────
-app.post("/api/verify/email/send", rateLimit(3, 10 * 60 * 1000), async (req, res) => {
   try {
-    const { email, name } = req.body;
-    if (!email) return res.status(400).json({ error: "Email required" });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ error: "Invalid email address" });
+    // If poster has a saved Stripe Customer, attach method to them
+    // Otherwise create a one-off PaymentIntent
+    const intentParams = {
+      amount: amountCents,
+      currency: "usd",
+      payment_method: paymentMethodId,
+      confirm: true,
+      capture_method: "manual",      // ← KEY: this holds funds without capturing
+      metadata: { jobId, jobTitle },
+      return_url: "https://yourdomain.com", // required for some card types
+    };
+
+    if (posterCustomerId) {
+      intentParams.customer = posterCustomerId;
     }
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    const expires = Date.now() + 10 * 60 * 1000;
-    emailCodes.set(email.toLowerCase(), { code, expires, attempts: 0 });
+    const intent = await stripe.paymentIntents.create(intentParams);
 
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: "Chores <verify@choresnearme.com>",
-        to: [email],
-        subject: "Your Chores verification code",
-        html: `
-          <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#fff;">
-            <div style="margin-bottom:24px;">
-              <span style="font-family:Georgia,serif;font-size:28px;font-weight:400;color:#1A2E22;letter-spacing:-1px;">chores</span>
-              <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#52B788;margin-left:2px;vertical-align:middle;"></span>
-            </div>
-            <p style="color:#374151;font-size:15px;margin-bottom:8px;">Hi ${name || "there"},</p>
-            <p style="color:#6B7280;font-size:14px;margin-bottom:28px;">Here's your verification code:</p>
-            <div style="background:#F0FAF4;border-radius:16px;padding:32px;text-align:center;margin-bottom:24px;">
-              <div style="font-size:48px;font-weight:900;letter-spacing:14px;color:#2D6A4F;font-family:monospace;">${code}</div>
-              <div style="font-size:12px;color:#9CA3AF;margin-top:12px;">Expires in 10 minutes</div>
-            </div>
-            <p style="color:#9CA3AF;font-size:12px;">If you didn't sign up on choresnearme.com, ignore this email.</p>
-          </div>
-        `,
-      }),
+    // If requires_action (3D Secure), send back client_secret so frontend can handle it
+    if (intent.status === "requires_action") {
+      return res.json({
+        requiresAction: true,
+        clientSecret: intent.client_secret,
+        intentId: intent.id,
+      });
+    }
+
+    if (intent.status !== "requires_capture") {
+      return res.json({ error: "Payment did not authorize. Please try a different card." });
+    }
+
+    res.json({ intentId: intent.id, status: intent.status });
+  } catch (err) {
+    console.error("Charge error:", err.message);
+    res.json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. RELEASE (Capture escrow + transfer to worker via Stripe Connect)
+//    Called when both parties confirm job completion
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/release", async (req, res) => {
+  // intentId — the PaymentIntent ID from /api/charge
+  // workerConnectId — the worker's Stripe Connected Account ID (stored in your DB)
+  // workerAmountCents — what the worker receives (job amount minus your 8% fee)
+  const { intentId, workerConnectId, workerAmountCents } = req.body;
+
+  try {
+    // Step 1: Capture the held funds
+    const intent = await stripe.paymentIntents.capture(intentId);
+
+    if (intent.status !== "succeeded") {
+      return res.json({ error: "Capture failed — payment did not succeed." });
+    }
+
+    // Step 2: Transfer worker's cut to their Connected Account
+    const transfer = await stripe.transfers.create({
+      amount: workerAmountCents,          // e.g. job is $35, fee 8% = $2.80, worker gets $32.20 → 3220
+      currency: "usd",
+      destination: workerConnectId,       // e.g. "acct_1ABC123..."
+      transfer_group: intentId,           // ties the transfer to this job's payment
+      metadata: { intentId },
     });
 
-    if (!response.ok) {
-      const err = await response.json();
-      console.error("Resend error:", err);
-      return res.status(400).json({ error: "Failed to send email — please try again." });
-    }
-
-    res.json({ sent: true });
+    res.json({ success: true, transferId: transfer.id });
   } catch (err) {
-    console.error("Email send error:", err.message);
-    res.status(500).json({ error: "Server error — please try again." });
+    console.error("Release error:", err.message);
+    res.json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// EMAIL VERIFICATION — check code (max 5 attempts)
-// ─────────────────────────────────────────────────────────────
-app.post("/api/verify/email/check", rateLimit(10, 5 * 60 * 1000), async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. REFUND (Cancel escrow and return money to poster)
+//    Called on disputes resolved in poster's favor, worker no-shows, etc.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/refund", async (req, res) => {
+  const { intentId, reason } = req.body;
+  // reason: "fraudulent" | "duplicate" | "requested_by_customer"
+
   try {
-    const { email, code } = req.body;
-    if (!email || !code) return res.status(400).json({ error: "Email and code required" });
+    // If still in requires_capture state (never captured), just cancel it
+    const intent = await stripe.paymentIntents.retrieve(intentId);
 
-    const stored = emailCodes.get(email.toLowerCase());
-    if (!stored) return res.json({ verified: false, error: "No code found — request a new one" });
-    if (Date.now() > stored.expires) {
-      emailCodes.delete(email.toLowerCase());
-      return res.json({ verified: false, error: "Code expired — request a new one" });
+    if (intent.status === "requires_capture") {
+      await stripe.paymentIntents.cancel(intentId);
+      return res.json({ success: true, method: "cancelled" });
     }
 
-    stored.attempts = (stored.attempts || 0) + 1;
-    if (stored.attempts > 5) {
-      emailCodes.delete(email.toLowerCase());
-      return res.json({ verified: false, error: "Too many attempts — request a new code" });
-    }
-    if (stored.code !== code.trim()) {
-      return res.json({ verified: false, error: "Incorrect code" });
-    }
+    // If already captured, issue a full refund
+    const refund = await stripe.refunds.create({
+      payment_intent: intentId,
+      reason: reason || "requested_by_customer",
+    });
 
-    emailCodes.delete(email.toLowerCase());
-    res.json({ verified: true });
+    res.json({ success: true, refundId: refund.id, method: "refunded" });
   } catch (err) {
-    console.error("Email check error:", err.message);
-    res.status(500).json({ error: "Server error — please try again." });
+    console.error("Refund error:", err.message);
+    res.json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// STRIPE IDENTITY — government ID verification
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. STRIPE CONNECT — Onboard a new worker
+//    Call this when a worker signs up and wants to receive payments
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/connect/onboard", async (req, res) => {
+  const { workerEmail, workerId } = req.body;
+
+  try {
+    // Create a Stripe Express account for this worker
+    const account = await stripe.accounts.create({
+      type: "express",
+      email: workerEmail,
+      capabilities: {
+        transfers: { requested: true },
+      },
+      metadata: { workerId },
+    });
+
+    // Create a one-time onboarding link (expires after ~10 min)
+    const accountLink = await stripe.accountLinks.create({
+      account: account.id,
+      refresh_url: "https://yourdomain.com/connect/refresh",  // if they need to restart
+      return_url:  "https://yourdomain.com/connect/complete", // after they finish
+      type: "account_onboarding",
+    });
+
+    // ⚠️ IMPORTANT: Save account.id to your database tied to workerId
+    // You'll need it for every future transfer
+    // e.g. db.workers.update({ id: workerId }, { stripeConnectId: account.id })
+
+    res.json({
+      connectId: account.id,
+      onboardingUrl: accountLink.url, // Send this URL to the worker — open it in browser
+    });
+  } catch (err) {
+    console.error("Connect onboard error:", err.message);
+    res.json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. STRIPE CONNECT — Check if worker's account is fully verified
+//    Call this before allowing a worker to accept jobs
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/connect/status", async (req, res) => {
+  const { connectId } = req.body;
+
+  try {
+    const account = await stripe.accounts.retrieve(connectId);
+
+    const isReady =
+      account.details_submitted &&
+      account.charges_enabled &&
+      account.payouts_enabled;
+
+    res.json({
+      ready: isReady,
+      detailsSubmitted: account.details_submitted,
+      chargesEnabled: account.charges_enabled,
+      payoutsEnabled: account.payouts_enabled,
+      // If not ready, tell the worker what's missing:
+      requirements: account.requirements?.currently_due || [],
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. SAVED CARDS — Create or retrieve a Stripe Customer for a poster
+//    Call this on poster signup so they can save cards
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/customer/create", async (req, res) => {
+  const { email, name, userId } = req.body;
+
+  try {
+    const customer = await stripe.customers.create({
+      email,
+      name,
+      metadata: { userId },
+    });
+
+    // ⚠️ Save customer.id to your DB tied to userId
+    res.json({ customerId: customer.id });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// Attach a new card to an existing customer (after they enter card details)
+app.post("/api/customer/save-card", async (req, res) => {
+  const { customerId, paymentMethodId } = req.body;
+
+  try {
+    await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId });
+
+    // Set as default
+    await stripe.customers.update(customerId, {
+      invoice_settings: { default_payment_method: paymentMethodId },
+    });
+
+    const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+    res.json({
+      success: true,
+      card: {
+        brand: pm.card.brand,
+        last4: pm.card.last4,
+        expMonth: pm.card.exp_month,
+        expYear: pm.card.exp_year,
+      },
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// List a customer's saved cards
+app.post("/api/customer/cards", async (req, res) => {
+  const { customerId } = req.body;
+
+  try {
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerId,
+      type: "card",
+    });
+
+    const cards = paymentMethods.data.map((pm) => ({
+      id: pm.id,
+      brand: pm.card.brand,
+      last4: pm.card.last4,
+      expMonth: pm.card.exp_month,
+      expYear: pm.card.exp_year,
+    }));
+
+    res.json({ cards });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. AUTO-RELEASE CRON — Release escrow after 48hrs with no dispute
+//    Call this endpoint from a Railway cron job every hour
+//    In Railway: add a Cron Job service, set schedule "0 * * * *", command:
+//    curl -X POST https://your-backend.railway.app/api/cron/auto-release
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/cron/auto-release", async (req, res) => {
+  // ⚠️ In production, protect this with a secret header:
+  // if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.sendStatus(401);
+
+  try {
+    // Fetch all PaymentIntents still in requires_capture
+    // that were created more than 48 hours ago
+    const fortyEightHoursAgo = Math.floor(Date.now() / 1000) - 48 * 60 * 60;
+
+    const intents = await stripe.paymentIntents.list({
+      limit: 100,
+      created: { lte: fortyEightHoursAgo },
+    });
+
+    const toRelease = intents.data.filter(
+      (i) => i.status === "requires_capture"
+    );
+
+    const results = [];
+
+    for (const intent of toRelease) {
+      try {
+        // Check metadata for worker info — you'd store this when creating the intent
+        const workerConnectId = intent.metadata.workerConnectId;
+        const workerAmountCents = parseInt(intent.metadata.workerAmountCents);
+
+        // Capture
+        await stripe.paymentIntents.capture(intent.id);
+
+        // Transfer to worker if we have their Connect ID
+        if (workerConnectId && workerAmountCents) {
+          await stripe.transfers.create({
+            amount: workerAmountCents,
+            currency: "usd",
+            destination: workerConnectId,
+            transfer_group: intent.id,
+          });
+        }
+
+        results.push({ id: intent.id, status: "released" });
+      } catch (err) {
+        results.push({ id: intent.id, status: "error", error: err.message });
+      }
+    }
+
+    res.json({ processed: results.length, results });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. WEBHOOKS — Stripe calls this URL when async events happen
+//    Set this URL in Stripe Dashboard → Developers → Webhooks:
+//    https://your-backend.railway.app/api/webhook
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/webhook", async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,                             // must be raw Buffer, NOT parsed JSON
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("Webhook signature failed:", err.message);
+    return res.sendStatus(400);
+  }
+
+  switch (event.type) {
+
+    // ── Payment held successfully in escrow ───────────────────────────────────
+    case "payment_intent.amount_capturable_updated": {
+      const intent = event.data.object;
+      console.log(`✅ Escrow live: ${intent.id} — $${intent.amount / 100}`);
+      // TODO: update your DB escrow record to status="held"
+      // TODO: push notification to worker that job is funded
+      break;
+    }
+
+    // ── Payment failed (card declined, etc.) ─────────────────────────────────
+    case "payment_intent.payment_failed": {
+      const intent = event.data.object;
+      const reason = intent.last_payment_error?.message || "Unknown error";
+      console.log(`❌ Payment failed: ${intent.id} — ${reason}`);
+      // TODO: update your DB record
+      // TODO: notify poster their payment failed, job is unbooked
+      break;
+    }
+
+    // ── Worker's Connect account was updated (verified, restricted, etc.) ─────
+    case "account.updated": {
+      const account = event.data.object;
+      const isReady = account.charges_enabled && account.payouts_enabled;
+      console.log(`🔄 Connect account updated: ${account.id} — ready: ${isReady}`);
+      // TODO: update worker's "payoutReady" field in your DB
+      // TODO: if newly ready, notify worker they can now accept jobs
+      break;
+    }
+
+    // ── Transfer to worker failed ─────────────────────────────────────────────
+    case "transfer.failed": {
+      const transfer = event.data.object;
+      console.log(`⚠️ Transfer failed: ${transfer.id} to ${transfer.destination}`);
+      // TODO: flag in your DB, notify admin, possibly hold funds and retry
+      break;
+    }
+
+    // ── Payout to worker's bank failed ────────────────────────────────────────
+    case "payout.failed": {
+      const payout = event.data.object;
+      console.log(`⚠️ Payout failed: ${payout.id} — ${payout.failure_message}`);
+      // TODO: notify worker to update their bank info in Stripe Express dashboard
+      break;
+    }
+
+    // ── Refund completed ─────────────────────────────────────────────────────
+    case "charge.refunded": {
+      const charge = event.data.object;
+      console.log(`💸 Refund complete: charge ${charge.id}`);
+      // TODO: update escrow record to status="refunded", notify poster
+      break;
+    }
+
+    default:
+      // Ignore unhandled event types
+      break;
+  }
+
+  res.sendStatus(200); // Always return 200 quickly or Stripe will retry
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. EMAIL VERIFICATION (already exists on your backend, included for reference)
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/verify/email/send  — send a 6-digit code to user's email
+// POST /api/verify/email/check — verify the code
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. IDENTITY VERIFICATION (Stripe Identity)
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/verify/identity/start", async (req, res) => {
   try {
-    const { userId, name } = req.body;
-    if (!userId) return res.status(400).json({ error: "userId required" });
-
     const session = await stripe.identity.verificationSessions.create({
       type: "document",
-      metadata: { userId, name: name || "", platform: "choresnearme.com" },
+      metadata: { userId: req.body.userId },
       options: {
         document: {
           allowed_types: ["driving_license", "passport", "id_card"],
@@ -151,151 +438,32 @@ app.post("/api/verify/identity/start", async (req, res) => {
           require_matching_selfie: true,
         },
       },
-      return_url: `${process.env.FRONTEND_URL || "https://choresnearme.com"}?verified=1`,
     });
 
-    res.json({ url: session.url, sessionId: session.id });
+    // Send client_secret to frontend — it opens Stripe's identity flow
+    res.json({ clientSecret: session.client_secret, sessionId: session.id });
   } catch (err) {
-    console.error("Identity start error:", err.message);
-    res.status(400).json({ error: err.message });
+    res.json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// CHARGE — hold payment in escrow
-// ─────────────────────────────────────────────────────────────
-app.post("/api/charge", async (req, res) => {
-  try {
-    const { paymentMethodId, amountCents, jobId, jobTitle } = req.body;
-    if (!paymentMethodId || !amountCents) {
-      return res.status(400).json({ error: "Missing paymentMethodId or amountCents" });
-    }
-    if (amountCents < 100) {
-      return res.status(400).json({ error: "Minimum charge is $1.00" });
-    }
+app.post("/api/verify/identity/check", async (req, res) => {
+  const { sessionId } = req.body;
 
-    const intent = await stripe.paymentIntents.create({
-      amount: amountCents,
-      currency: "usd",
-      payment_method: paymentMethodId,
-      capture_method: "manual",
-      confirm: true,
-      automatic_payment_methods: { enabled: true, allow_redirects: "never" },
-      metadata: { jobId: jobId || "", jobTitle: jobTitle || "", platform: "choresnearme.com" },
+  try {
+    const session = await stripe.identity.verificationSessions.retrieve(sessionId);
+
+    res.json({
+      status: session.status,              // "verified" | "processing" | "requires_input"
+      verified: session.status === "verified",
     });
-
-    res.json({ intentId: intent.id, status: intent.status, amount: intent.amount });
   } catch (err) {
-    console.error("Charge error:", err.message);
-    res.status(400).json({ error: err.message });
+    res.json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// RELEASE — job done, move money
-// ─────────────────────────────────────────────────────────────
-app.post("/api/release", async (req, res) => {
-  try {
-    const { intentId } = req.body;
-    if (!intentId) return res.status(400).json({ error: "Missing intentId" });
-    const intent = await stripe.paymentIntents.capture(intentId);
-    res.json({ status: intent.status, amount: intent.amount_received });
-  } catch (err) {
-    console.error("Release error:", err.message);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// REFUND — dispute or no-show
-// ─────────────────────────────────────────────────────────────
-app.post("/api/refund", async (req, res) => {
-  try {
-    const { intentId, reason } = req.body;
-    if (!intentId) return res.status(400).json({ error: "Missing intentId" });
-    const validReasons = ["duplicate", "fraudulent", "requested_by_customer"];
-    const refund = await stripe.refunds.create({
-      payment_intent: intentId,
-      reason: validReasons.includes(reason) ? reason : "requested_by_customer",
-    });
-    res.json({ refundId: refund.id, status: refund.status, amount: refund.amount });
-  } catch (err) {
-    console.error("Refund error:", err.message);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// SETUP INTENT — save card without charging
-// ─────────────────────────────────────────────────────────────
-app.post("/api/setup-intent", async (req, res) => {
-  try {
-    const { customerId } = req.body;
-    const params = { usage: "off_session" };
-    if (customerId) params.customer = customerId;
-    const setupIntent = await stripe.setupIntents.create(params);
-    res.json({ clientSecret: setupIntent.client_secret });
-  } catch (err) {
-    console.error("SetupIntent error:", err.message);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// STRIPE WEBHOOK
-// Add this URL in Stripe Dashboard → Developers → Webhooks:
-// https://chores-backend-production-2051.up.railway.app/api/webhook
-// ─────────────────────────────────────────────────────────────
-app.post("/api/webhook", express.raw({ type: "application/json" }), (req, res) => {
-  const sig = req.headers["stripe-signature"];
-
-  if (!process.env.STRIPE_WEBHOOK_SECRET) {
-    console.warn("⚠️ STRIPE_WEBHOOK_SECRET not set — skipping verification");
-    return res.json({ received: true });
-  }
-
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error("Webhook signature failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  switch (event.type) {
-    case "payment_intent.amount_capturable_updated":
-      console.log("💰 Escrow held:", event.data.object.id, "| Job:", event.data.object.metadata?.jobTitle);
-      break;
-    case "payment_intent.succeeded":
-      console.log("✅ Payment released:", event.data.object.id, "| $" + (event.data.object.amount_received / 100).toFixed(2));
-      break;
-    case "payment_intent.payment_failed":
-      console.log("❌ Payment failed:", event.data.object.last_payment_error?.message);
-      break;
-    case "charge.refunded":
-      console.log("↩️ Refund processed:", event.data.object.id);
-      break;
-    case "identity.verification_session.verified":
-      console.log("🪪 ID verified:", event.data.object.metadata?.userId);
-      // TODO: mark user as idVerified:true in your database
-      break;
-    case "identity.verification_session.requires_input":
-      console.log("❌ ID verification failed:", event.data.object.last_error?.reason);
-      break;
-    default:
-      console.log("Stripe event:", event.type);
-  }
-
-  res.json({ received: true });
-});
-
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // START
-// ─────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`✅ Chores API running on port ${PORT}`);
-  console.log(`   Stripe:  ${process.env.STRIPE_SECRET_KEY ? "✅ connected" : "❌ missing STRIPE_SECRET_KEY"}`);
-  console.log(`   Resend:  ${process.env.RESEND_API_KEY ? "✅ connected" : "❌ missing RESEND_API_KEY"}`);
-  console.log(`   Webhook: ${process.env.STRIPE_WEBHOOK_SECRET ? "✅ secured" : "⚠️  missing STRIPE_WEBHOOK_SECRET"}`);
-});
+// ─────────────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`ChoresApp backend running on port ${PORT}`));
