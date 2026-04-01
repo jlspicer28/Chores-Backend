@@ -1,17 +1,145 @@
 /**
- * ChoresApp — Complete Stripe Backend
+ * ChoresApp — Complete Stripe Backend + Push Notifications
  * Stack: Node.js + Express
- * Deploy: Railway (set env vars in Railway dashboard)
+ * Deploy: Render (set env vars in Render dashboard)
  *
  * ENV VARS NEEDED:
  *   STRIPE_SECRET_KEY      — sk_live_...
  *   STRIPE_WEBHOOK_SECRET  — whsec_...  (from Stripe Dashboard > Webhooks)
- *   PORT                   — Railway sets this automatically
+ *   SUPABASE_URL           — https://xxx.supabase.co
+ *   SUPABASE_SERVICE_KEY   — service_role key from Supabase
+ *   APNS_KEY_ID            — Key ID from Apple Developer Portal
+ *   APNS_TEAM_ID           — Team ID from Apple Developer Portal
+ *   APNS_KEY_BASE64        — Base64-encoded .p8 APNs key file contents
+ *   APNS_BUNDLE_ID         — com.choresapp.Chores
+ *   PORT                   — Render sets this automatically
  */
 
 const express = require("express");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require("@supabase/supabase-js");
+const http2 = require("http2");
+const crypto = require("crypto");
 const app = express();
+
+// Supabase client (for device tokens table)
+const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+  : null;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// APNs PUSH NOTIFICATION SENDER (HTTP/2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function createApnsJwt() {
+  const keyBase64 = process.env.APNS_KEY_BASE64;
+  if (!keyBase64) return null;
+
+  const key = Buffer.from(keyBase64, "base64").toString("utf8");
+  const header = Buffer.from(JSON.stringify({
+    alg: "ES256",
+    kid: process.env.APNS_KEY_ID,
+  })).toString("base64url");
+
+  const claims = Buffer.from(JSON.stringify({
+    iss: process.env.APNS_TEAM_ID,
+    iat: Math.floor(Date.now() / 1000),
+  })).toString("base64url");
+
+  const signer = crypto.createSign("SHA256");
+  signer.update(`${header}.${claims}`);
+  const signature = signer.sign(key, "base64url");
+
+  return `${header}.${claims}.${signature}`;
+}
+
+async function sendPushNotification(deviceToken, title, body, data = {}) {
+  if (!process.env.APNS_KEY_BASE64) {
+    console.log("[APNs] Skipping push — APNS_KEY_BASE64 not configured");
+    return;
+  }
+
+  const jwt = createApnsJwt();
+  if (!jwt) return;
+
+  const bundleId = process.env.APNS_BUNDLE_ID || "com.choresapp.Chores";
+  const host = process.env.NODE_ENV === "production"
+    ? "api.push.apple.com"
+    : "api.sandbox.push.apple.com";
+
+  return new Promise((resolve, reject) => {
+    const client = http2.connect(`https://${host}`);
+
+    const payload = JSON.stringify({
+      aps: {
+        alert: { title, body },
+        sound: "default",
+        badge: 1,
+      },
+      ...data,
+    });
+
+    const headers = {
+      ":method": "POST",
+      ":path": `/3/device/${deviceToken}`,
+      "authorization": `bearer ${jwt}`,
+      "apns-topic": bundleId,
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "content-type": "application/json",
+    };
+
+    const req = client.request(headers);
+    let responseData = "";
+
+    req.on("response", (headers) => {
+      const status = headers[":status"];
+      if (status === 200) {
+        console.log(`[APNs] Push sent to ${deviceToken.substring(0, 8)}...`);
+        resolve(true);
+      } else {
+        console.log(`[APNs] Push failed: status ${status}`);
+      }
+    });
+
+    req.on("data", (chunk) => { responseData += chunk; });
+    req.on("end", () => {
+      client.close();
+      if (responseData) {
+        try {
+          const parsed = JSON.parse(responseData);
+          if (parsed.reason) console.log(`[APNs] Error: ${parsed.reason}`);
+        } catch {}
+      }
+      resolve(false);
+    });
+
+    req.on("error", (err) => {
+      console.log(`[APNs] Request error: ${err.message}`);
+      client.close();
+      resolve(false);
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+// Send push to a user by their userId (looks up their device tokens)
+async function sendPushToUser(userId, title, body, data = {}) {
+  if (!supabase) return;
+
+  const { data: tokens, error } = await supabase
+    .from("device_tokens")
+    .select("device_token")
+    .eq("user_id", userId);
+
+  if (error || !tokens || tokens.length === 0) return;
+
+  for (const row of tokens) {
+    await sendPushNotification(row.device_token, title, body, data);
+  }
+}
 
 // ─── IMPORTANT: Raw body needed for webhook signature verification ────────────
 app.use("/api/webhook", express.raw({ type: "application/json" }));
@@ -460,6 +588,59 @@ app.post("/api/verify/identity/check", async (req, res) => {
   } catch (err) {
     res.json({ error: err.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUSH NOTIFICATIONS — Device Token Registration
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post("/api/push/register", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.json({ error: "No token provided" });
+
+  const { deviceToken, platform } = req.body;
+  if (!deviceToken) return res.json({ error: "deviceToken required" });
+
+  if (!supabase) return res.json({ error: "Database not configured" });
+
+  try {
+    // Decode JWT to get user ID
+    const jwt = authHeader.replace("Bearer ", "");
+    const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64").toString());
+    const userId = payload.sub;
+
+    // Upsert device token (avoid duplicates)
+    const { error } = await supabase
+      .from("device_tokens")
+      .upsert(
+        {
+          user_id: userId,
+          device_token: deviceToken,
+          platform: platform || "ios",
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "device_token" }
+      );
+
+    if (error) {
+      console.log("[Push] Token registration error:", error.message);
+      return res.json({ error: error.message });
+    }
+
+    console.log(`[Push] Token registered for user ${userId.substring(0, 8)}...`);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// Test push endpoint (for development)
+app.post("/api/push/test", async (req, res) => {
+  const { userId, title, body } = req.body;
+  if (!userId) return res.json({ error: "userId required" });
+
+  await sendPushToUser(userId, title || "Test", body || "This is a test push notification", { type: "test" });
+  res.json({ success: true });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
